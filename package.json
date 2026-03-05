@@ -1,0 +1,19 @@
+{
+  "name": "aether",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "typescript": "^5.8.2"
+  },
+  "workspaces": [
+    "cli",
+    "sdk/ts"
+  ],
+  "scripts": {
+    "build": "npm run -w sdk/ts build && npm run -w cli build",
+    "lint": "npm run -w cli lint && npm run -w sdk/ts lint",
+    "test:evolution": "node scripts/evolution-loop.test.mjs"
+  }
+}

@@ -32,6 +32,7 @@ node dist/index.js run --workflow growth
 node dist/index.js runs
 node dist/index.js pending-approvals
 node dist/index.js approve --run-id <RUN_ID> --step-id <STEP_ID> --reason "Reviewed risk controls; approved"
+node dist/index.js evolve --workflow growth --dry-run
 ```
 
 3. See metrics:
@@ -56,8 +57,13 @@ start http://127.0.0.1:8080/ui
 
 ## Lightweight Evolution Loop
 
-Use metrics to select safer, cheaper variants:
+Use metrics to select and promote safer, cheaper variants deterministically:
 
 ```powershell
-node scripts/evolution-loop.mjs state/variant-metrics.json
+node scripts/evolution-loop.mjs --workflow growth --input state/variant-metrics.json --dry-run
 ```
+
+Persisted outputs:
+
+- `state/active-variant.json`: currently promoted variant per workflow
+- `state/variant-decisions.jsonl`: append-only evolution decisions for audit trail
