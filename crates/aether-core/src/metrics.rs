@@ -17,6 +17,7 @@ pub struct AppMetrics {
     pub pending_approvals: IntGauge,
     pub approvals_requested: IntCounter,
     pub approvals_granted: IntCounter,
+    pub approval_actions: IntCounterVec,
     pub decision_path: IntCounterVec,
 }
 
@@ -77,6 +78,12 @@ impl AppMetrics {
             "Total approvals granted",
             registry
         )?;
+        let approval_actions = register_int_counter_vec_with_registry!(
+            "approval_actions_total",
+            "Approval API outcomes by operation and status",
+            &["operation", "status"],
+            registry
+        )?;
         let decision_path = register_int_counter_vec_with_registry!(
             "decision_path_total",
             "Decision path counter",
@@ -96,6 +103,7 @@ impl AppMetrics {
             pending_approvals,
             approvals_requested,
             approvals_granted,
+            approval_actions,
             decision_path,
         })
     }

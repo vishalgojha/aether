@@ -100,17 +100,42 @@ impl Orchestrator {
         result
     }
 
-    #[instrument(skip(self), fields(run_id = %run_id, step_id = %step_id, actor = %actor))]
-    pub fn approve(&self, run_id: &str, step_id: &str, actor: &str) -> anyhow::Result<bool> {
-        let approved = self.state.approve(run_id, step_id, actor)?;
+    #[instrument(skip(self, reason), fields(run_id = %run_id, step_id = %step_id, actor = %actor))]
+    pub fn approve(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            anyhow::bail!("approval reason required");
+        }
+
+        let approved = self.state.approve(run_id, step_id, actor, reason)?;
         if approved {
             self.metrics.pending_approvals.dec();
             self.metrics.approvals_granted.inc();
             self.state.append_event(
                 run_id,
                 "approval_granted",
-                &json!({ "step_id": step_id, "actor": actor }),
+                &json!({ "step_id": step_id, "actor": actor, "reason": reason }),
             )?;
+            info!(
+                run_id = %run_id,
+                step_id = %step_id,
+                actor = %actor,
+                reason = %reason,
+                "approval granted with rationale"
+            );
+        } else {
+            info!(
+                run_id = %run_id,
+                step_id = %step_id,
+                actor = %actor,
+                "approval request not found"
+            );
         }
         Ok(approved)
     }
