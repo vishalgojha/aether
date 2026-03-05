@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::json;
 use thiserror::Error;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -43,7 +43,9 @@ impl Orchestrator {
         }
     }
 
+    #[instrument(skip(self, req), fields(workflow = %req.workflow))]
     pub async fn run_new(&self, req: RunRequest) -> anyhow::Result<RunOutcome> {
+        let started = Instant::now();
         let run_id = Uuid::new_v4().to_string();
         let workflow = req.workflow.clone();
         self.state.create_run(&run_id, &workflow)?;
@@ -52,10 +54,22 @@ impl Orchestrator {
             "run_created",
             &json!({ "workflow": req.workflow, "input": req.input }),
         )?;
-        self.execute(run_id, workflow, 0, 0, 0.0).await
+        let result = self.execute(run_id, workflow, 0, 0, 0.0).await;
+        self.observe_run_duration("run_new", &result, started.elapsed().as_secs_f64());
+        if let Ok(outcome) = &result {
+            info!(
+                run_id = %outcome.run_id,
+                status = ?outcome.status,
+                completed_steps = outcome.completed_steps,
+                "run completed"
+            );
+        }
+        result
     }
 
+    #[instrument(skip(self), fields(run_id = %run_id))]
     pub async fn replay(&self, run_id: &str) -> anyhow::Result<RunOutcome> {
+        let started = Instant::now();
         let run = self
             .state
             .get_run(run_id)?
@@ -65,20 +79,33 @@ impl Orchestrator {
             "replay_requested",
             &json!({ "at": Utc::now().to_rfc3339(), "current_status": run.status.clone() }),
         )?;
-        self.execute(
-            run_id.to_string(),
-            run.workflow,
-            run.step_count,
-            run.total_tokens,
-            run.total_cost_usd,
-        )
-        .await
+        let result = self
+            .execute(
+                run_id.to_string(),
+                run.workflow,
+                run.step_count,
+                run.total_tokens,
+                run.total_cost_usd,
+            )
+            .await;
+        self.observe_run_duration("replay", &result, started.elapsed().as_secs_f64());
+        if let Ok(outcome) = &result {
+            info!(
+                run_id = %outcome.run_id,
+                status = ?outcome.status,
+                completed_steps = outcome.completed_steps,
+                "replay completed"
+            );
+        }
+        result
     }
 
+    #[instrument(skip(self), fields(run_id = %run_id, step_id = %step_id, actor = %actor))]
     pub fn approve(&self, run_id: &str, step_id: &str, actor: &str) -> anyhow::Result<bool> {
         let approved = self.state.approve(run_id, step_id, actor)?;
         if approved {
             self.metrics.pending_approvals.dec();
+            self.metrics.approvals_granted.inc();
             self.state.append_event(
                 run_id,
                 "approval_granted",
@@ -153,8 +180,13 @@ impl Orchestrator {
         }
 
         self.metrics.runs_started.inc();
-        self.state
-            .update_run(&run_id, RunStatus::Running, total_tokens, total_cost_usd, starting_step)?;
+        self.state.update_run(
+            &run_id,
+            RunStatus::Running,
+            total_tokens,
+            total_cost_usd,
+            starting_step,
+        )?;
 
         for step in starting_step..self.config.max_steps {
             if self.config.kill_switch_active() {
@@ -187,7 +219,10 @@ impl Orchestrator {
                 DecisionPath::Supervisor => "supervisor",
                 DecisionPath::DebateFallback => "debate",
             };
-            self.metrics.decision_path.with_label_values(&[path_label]).inc();
+            self.metrics
+                .decision_path
+                .with_label_values(&[path_label])
+                .inc();
 
             if total_tokens + decision.estimated_tokens as u64 > self.config.per_run_token_cap {
                 self.state.append_event(
@@ -218,6 +253,7 @@ impl Orchestrator {
 
             if needs_human_approval(&decision, self.config.approval_ad_spend_usd) {
                 self.metrics.pending_approvals.inc();
+                self.metrics.approvals_requested.inc();
                 self.state.create_approval_request(
                     &run_id,
                     &decision.step_id,
@@ -281,7 +317,9 @@ impl Orchestrator {
                 Ok(()) => {
                     total_tokens += decision.estimated_tokens as u64;
                     total_cost_usd += decision.estimated_cost_usd;
-                    self.metrics.tokens_used.inc_by(decision.estimated_tokens as u64);
+                    self.metrics
+                        .tokens_used
+                        .inc_by(decision.estimated_tokens as u64);
                     self.metrics
                         .cost_microusd
                         .inc_by((decision.estimated_cost_usd * 1_000_000.0).round() as u64);
@@ -394,8 +432,13 @@ impl Orchestrator {
         step_count: u32,
         status_label: &str,
     ) -> anyhow::Result<()> {
-        self.state
-            .update_run(run_id, status.clone(), total_tokens, total_cost_usd, step_count)?;
+        self.state.update_run(
+            run_id,
+            status.clone(),
+            total_tokens,
+            total_cost_usd,
+            step_count,
+        )?;
         self.state.append_event(
             run_id,
             "run_finished",
@@ -406,8 +449,27 @@ impl Orchestrator {
                 "completed_steps": step_count
             }),
         )?;
-        self.metrics.runs_finished.with_label_values(&[status_label]).inc();
+        self.metrics
+            .runs_finished
+            .with_label_values(&[status_label])
+            .inc();
         Ok(())
+    }
+
+    fn observe_run_duration(
+        &self,
+        operation: &str,
+        result: &anyhow::Result<RunOutcome>,
+        elapsed_seconds: f64,
+    ) {
+        let status = match result {
+            Ok(outcome) => run_status_label(&outcome.status),
+            Err(_) => "error",
+        };
+        self.metrics
+            .run_duration_seconds
+            .with_label_values(&[operation, status])
+            .observe(elapsed_seconds);
     }
 
     fn supervisor_decide(&self, workflow: &str, step: u32) -> anyhow::Result<StepDecision> {
@@ -432,7 +494,11 @@ impl Orchestrator {
         Ok(StepDecision {
             step_id: format!("step-{step}"),
             action: action.to_string(),
-            confidence: if action == "generic_tool_call" { 0.55 } else { 0.82 },
+            confidence: if action == "generic_tool_call" {
+                0.55
+            } else {
+                0.82
+            },
             risk_score: if action == "socialflow_launch_campaign" {
                 0.81
             } else {
@@ -547,4 +613,15 @@ fn needs_human_approval(decision: &StepDecision, threshold: f64) -> bool {
         .unwrap_or(0.0);
     let is_bulk = decision.action.contains("bulk");
     spend > threshold || is_bulk
+}
+
+fn run_status_label(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::WaitingApproval => "waiting_approval",
+        RunStatus::BudgetExceeded => "budget_exceeded",
+        RunStatus::Killed => "killed",
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::Failed => "failed",
+    }
 }
