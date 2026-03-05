@@ -8,22 +8,25 @@
  * - Emits metric-like lines for local observability
  */
 
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_STATE_DIR = "state";
 const DEFAULT_INPUT = path.join(DEFAULT_STATE_DIR, "variant-metrics.json");
+const DEFAULT_OBSERVATIONS_INPUT = path.join(DEFAULT_STATE_DIR, "variant-observations.jsonl");
 const DEFAULT_WORKFLOW = "growth";
 const DEFAULT_MIN_SAMPLES = 5;
 const DEFAULT_SAFETY_FLOOR = Number(process.env.AETHER_SAFETY_FLOOR ?? "0.95");
 
 export async function runEvolution(input) {
   const opts = normalizeOptions(input);
-  const rawVariants = await readVariants(opts.inputPath);
+  const inputPath =
+    opts.inputPath ?? (await discoverInputPath(opts.stateDir, opts.workflow)) ?? DEFAULT_INPUT;
+  const rawVariants = await readVariants(inputPath);
   const prepared = normalizeVariants(rawVariants, opts.workflow);
   if (prepared.length === 0) {
-    throw new Error(`No variants found for workflow '${opts.workflow}'.`);
+    throw new Error(`No variants found for workflow '${opts.workflow}' in '${inputPath}'.`);
   }
 
   const eligible = prepared.filter((variant) => variant.safetyScore >= opts.safetyFloor);
@@ -59,6 +62,7 @@ export async function runEvolution(input) {
 
   const decision = {
     timestamp: selectedAt,
+    input_path: inputPath,
     workflow: opts.workflow,
     status,
     promoted_variant: promoted ? winner.variantId : null,
@@ -114,14 +118,71 @@ function summarizeVariant(variant) {
 
 async function readVariants(inputPath) {
   const raw = await readFile(inputPath, "utf-8");
-  const parsed = JSON.parse(raw);
-  if (!Array.isArray(parsed)) {
-    throw new Error("Variant metrics input must be a JSON array.");
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
   }
-  return parsed;
+
+  if (trimmed.startsWith("[")) {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed)) {
+      throw new Error("Variant metrics input must be a JSON array.");
+    }
+    return parsed;
+  }
+
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed.variants)) {
+        return parsed.variants;
+      }
+      throw new Error("Variant metrics JSON object must contain a 'variants' array.");
+    } catch {
+      // fall through to JSONL fallback below
+    }
+  }
+
+  // JSONL fallback for observation streams.
+  return trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function discoverInputPath(stateDir, workflow) {
+  const candidates = [
+    path.join(stateDir, `variant-observations-${workflow}.jsonl`),
+    path.join(stateDir, `variant-metrics-${workflow}.json`),
+    path.join(stateDir, "variant-observations.jsonl"),
+    path.join(stateDir, "variant-metrics.json"),
+    DEFAULT_OBSERVATIONS_INPUT,
+    DEFAULT_INPUT
+  ];
+
+  for (const candidate of candidates) {
+    if (await exists(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function exists(targetPath) {
+  try {
+    await access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeVariants(rawVariants, workflow) {
+  if (looksLikeObservationSeries(rawVariants)) {
+    return aggregateObservations(rawVariants, workflow);
+  }
+
   return rawVariants
     .map((raw) => normalizeVariant(raw, workflow))
     .filter((variant) => variant.workflow === workflow);
@@ -147,12 +208,130 @@ function normalizeVariant(raw, defaultWorkflow) {
   };
 }
 
+function looksLikeObservationSeries(rawVariants) {
+  return rawVariants.some((record) => {
+    if (!record || typeof record !== "object") {
+      return false;
+    }
+    const hasRunIdentity = record.run_id !== undefined || record.runId !== undefined;
+    const hasVariantIdentity =
+      record.variant_id !== undefined || record.variantId !== undefined || record.variant !== undefined;
+    return hasRunIdentity && hasVariantIdentity;
+  });
+}
+
+function aggregateObservations(observations, workflow) {
+  const latestByRun = new Map();
+  let syntheticRunIndex = 0;
+  for (const raw of observations) {
+    const normalized = normalizeObservation(raw, workflow, syntheticRunIndex);
+    syntheticRunIndex += 1;
+    if (!normalized || normalized.workflow !== workflow) {
+      continue;
+    }
+
+    const existing = latestByRun.get(normalized.runId);
+    if (!existing || normalized.timestampMs >= existing.timestampMs) {
+      latestByRun.set(normalized.runId, normalized);
+    }
+  }
+
+  const grouped = new Map();
+  for (const observation of latestByRun.values()) {
+    const group = grouped.get(observation.variantId) ?? [];
+    group.push(observation);
+    grouped.set(observation.variantId, group);
+  }
+
+  const variants = [];
+  for (const [variantId, records] of grouped.entries()) {
+    const sampleSize = records.length;
+    if (sampleSize === 0) {
+      continue;
+    }
+    const successCount = records.filter((record) => record.success).length;
+    const successRate = successCount / sampleSize;
+    const avgCostPerRunUsd =
+      records.reduce((total, record) => total + record.totalCostUsd, 0) / sampleSize;
+    const p95LatencyMs = percentile95(records.map((record) => record.durationSec * 1000));
+    const safetyValues = records
+      .map((record) => record.safetyScore)
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const safetyScore =
+      safetyValues.length > 0
+        ? safetyValues.reduce((total, value) => total + value, 0) / safetyValues.length
+        : 1;
+
+    variants.push({
+      workflow,
+      variantId,
+      successRate,
+      sampleSize,
+      avgCostPerRunUsd,
+      p95LatencyMs,
+      safetyScore
+    });
+  }
+
+  return variants;
+}
+
+function normalizeObservation(raw, fallbackWorkflow, fallbackIndex) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const variantId = trimString(raw.variant_id ?? raw.variantId ?? raw.variant ?? "");
+  if (!variantId) {
+    return null;
+  }
+
+  const workflow = normalizeWorkflow(raw.workflow ?? raw.workflow_name ?? fallbackWorkflow);
+  const runId = trimString(raw.run_id ?? raw.runId ?? `synthetic-run-${fallbackIndex}`);
+  const status = normalizeWorkflow(raw.status ?? "");
+  const success = raw.success === true || status === "succeeded";
+  const durationSec = normalizeNumber(
+    raw.duration_sec ?? raw.durationSec ?? raw.latency_sec ?? raw.latencySeconds ?? 0
+  );
+  const totalCostUsd = normalizeNumber(
+    raw.total_cost_usd ??
+      raw.estimated_cost_usd ??
+      raw.cost_usd ??
+      raw.avg_cost_per_run_usd ??
+      raw.avgCostPerRun ??
+      0
+  );
+  const timestampRaw = raw.timestamp ?? raw.updated_at ?? raw.created_at ?? "";
+  const timestampMs = Number(new Date(timestampRaw).getTime());
+  const safetyScore = normalizeNumber(raw.safety_score ?? raw.safetyScore ?? 1);
+
+  return {
+    workflow,
+    variantId,
+    runId,
+    status,
+    success,
+    durationSec,
+    totalCostUsd,
+    safetyScore,
+    timestampMs: Number.isFinite(timestampMs) ? timestampMs : 0
+  };
+}
+
+function percentile95(values) {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.max(0, Math.ceil(sorted.length * 0.95) - 1);
+  return sorted[index];
+}
+
 function normalizeOptions(input) {
   const options = input ?? {};
   const stateDir = trimString(options.stateDir ?? DEFAULT_STATE_DIR);
   return {
     workflow: normalizeWorkflow(options.workflow ?? DEFAULT_WORKFLOW),
-    inputPath: trimString(options.inputPath ?? DEFAULT_INPUT),
+    inputPath: options.inputPath ? trimString(options.inputPath) : undefined,
     stateDir,
     activeVariantPath: trimString(
       options.activeVariantPath ?? path.join(stateDir, "active-variant.json")
@@ -263,7 +442,10 @@ function parseCliArgs(argv) {
 
   if (positional.length > 0) {
     const first = positional[0];
-    if (first.toLowerCase().endsWith(".json") && !options.inputPath) {
+    if (
+      (first.toLowerCase().endsWith(".json") || first.toLowerCase().endsWith(".jsonl")) &&
+      !options.inputPath
+    ) {
       options.inputPath = first;
     } else if (!options.workflow) {
       options.workflow = first;

@@ -1,4 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Error as SqlError};
@@ -9,6 +14,7 @@ use crate::types::{EventRecord, PendingApproval, PersistedRun, RunStatus};
 #[derive(Clone)]
 pub struct StateStore {
     conn: Arc<Mutex<Connection>>,
+    db_path: String,
 }
 
 impl StateStore {
@@ -16,6 +22,7 @@ impl StateStore {
         let conn = Connection::open(path)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            db_path: path.to_string(),
         };
         store.init()?;
         Ok(store)
@@ -32,6 +39,7 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
                 workflow TEXT NOT NULL,
+                variant_id TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -76,11 +84,21 @@ impl StateStore {
             );
             ",
         )?;
+        add_column_if_missing(&conn, "runs", "variant_id", "TEXT")?;
         add_column_if_missing(&conn, "approvals", "approved_reason", "TEXT")?;
         Ok(())
     }
 
     pub fn create_run(&self, run_id: &str, workflow: &str) -> anyhow::Result<()> {
+        self.create_run_with_variant(run_id, workflow, None)
+    }
+
+    pub fn create_run_with_variant(
+        &self,
+        run_id: &str,
+        workflow: &str,
+        variant_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self
             .conn
@@ -88,10 +106,17 @@ impl StateStore {
             .map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
         conn.execute(
             "
-            INSERT INTO runs(run_id, workflow, status, created_at, updated_at, total_tokens, total_cost_usd, step_count)
-            VALUES (?1, ?2, ?3, ?4, ?5, 0, 0.0, 0)
+            INSERT INTO runs(run_id, workflow, variant_id, status, created_at, updated_at, total_tokens, total_cost_usd, step_count)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0.0, 0)
             ",
-            params![run_id, workflow, "running", now, now],
+            params![
+                run_id,
+                workflow,
+                variant_id,
+                "running",
+                now,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -237,24 +262,25 @@ impl StateStore {
             .map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
         let mut stmt = conn.prepare(
             "
-            SELECT run_id, workflow, status, created_at, updated_at, total_tokens, total_cost_usd, step_count
+            SELECT run_id, workflow, variant_id, status, created_at, updated_at, total_tokens, total_cost_usd, step_count
             FROM runs WHERE run_id = ?1
             ",
         )?;
         let mut rows = stmt.query(params![run_id])?;
         if let Some(row) = rows.next()? {
-            let status: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            let updated_at: String = row.get(4)?;
+            let status: String = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            let updated_at: String = row.get(5)?;
             return Ok(Some(PersistedRun {
                 run_id: row.get(0)?,
                 workflow: row.get(1)?,
+                variant_id: row.get(2)?,
                 status: str_to_status(&status),
                 created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
                 updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
-                total_tokens: row.get::<_, i64>(5)? as u64,
-                total_cost_usd: row.get(6)?,
-                step_count: row.get::<_, i64>(7)? as u32,
+                total_tokens: row.get::<_, i64>(6)? as u64,
+                total_cost_usd: row.get(7)?,
+                step_count: row.get::<_, i64>(8)? as u32,
             }));
         }
         Ok(None)
@@ -298,7 +324,7 @@ impl StateStore {
             .map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
         let mut stmt = conn.prepare(
             "
-            SELECT run_id, workflow, status, created_at, updated_at, total_tokens, total_cost_usd, step_count
+            SELECT run_id, workflow, variant_id, status, created_at, updated_at, total_tokens, total_cost_usd, step_count
             FROM runs
             ORDER BY created_at DESC
             LIMIT ?1
@@ -307,18 +333,19 @@ impl StateStore {
         let mut rows = stmt.query(params![limit as i64])?;
         let mut runs = Vec::new();
         while let Some(row) = rows.next()? {
-            let status: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            let updated_at: String = row.get(4)?;
+            let status: String = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            let updated_at: String = row.get(5)?;
             runs.push(PersistedRun {
                 run_id: row.get(0)?,
                 workflow: row.get(1)?,
+                variant_id: row.get(2)?,
                 status: str_to_status(&status),
                 created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
                 updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
-                total_tokens: row.get::<_, i64>(5)? as u64,
-                total_cost_usd: row.get(6)?,
-                step_count: row.get::<_, i64>(7)? as u32,
+                total_tokens: row.get::<_, i64>(6)? as u64,
+                total_cost_usd: row.get(7)?,
+                step_count: row.get::<_, i64>(8)? as u32,
             });
         }
         Ok(runs)
@@ -389,6 +416,54 @@ impl StateStore {
             prev_hash = Some(event.event_hash);
         }
         Ok(true)
+    }
+
+    pub fn append_variant_observation(&self, run_id: &str) -> anyhow::Result<()> {
+        let Some(run) = self.get_run(run_id)? else {
+            return Ok(());
+        };
+        let Some(variant_id) = run.variant_id.as_ref() else {
+            return Ok(());
+        };
+        if variant_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let duration_seconds = run
+            .updated_at
+            .signed_duration_since(run.created_at)
+            .to_std()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        let observation = serde_json::json!({
+            "timestamp": run.updated_at.to_rfc3339(),
+            "run_id": run.run_id,
+            "workflow": run.workflow,
+            "variant_id": variant_id,
+            "status": status_to_str(&run.status),
+            "success": matches!(run.status, RunStatus::Succeeded),
+            "duration_sec": duration_seconds,
+            "total_tokens": run.total_tokens,
+            "total_cost_usd": run.total_cost_usd,
+            "step_count": run.step_count
+        });
+
+        let observations_path = self.variant_observations_path();
+        if let Some(parent) = observations_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(observations_path)?;
+        writeln!(file, "{}", observation)?;
+        Ok(())
+    }
+
+    fn variant_observations_path(&self) -> PathBuf {
+        let db_path = Path::new(&self.db_path);
+        let base_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+        base_dir.join("variant-observations.jsonl")
     }
 }
 

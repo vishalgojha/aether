@@ -67,3 +67,11 @@ Persisted outputs:
 
 - `state/active-variant.json`: currently promoted variant per workflow
 - `state/variant-decisions.jsonl`: append-only evolution decisions for audit trail
+- `state/variant-observations.jsonl`: run-finish observations emitted by the core runtime when a run has `variant_id`
+
+Input discovery (if `--input` is omitted) checks, in order:
+
+1. `state/variant-observations-<workflow>.jsonl`
+2. `state/variant-metrics-<workflow>.json`
+3. `state/variant-observations.jsonl`
+4. `state/variant-metrics.json`

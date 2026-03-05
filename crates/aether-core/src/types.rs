@@ -59,6 +59,7 @@ pub enum DecisionPath {
 pub struct PersistedRun {
     pub run_id: String,
     pub workflow: String,
+    pub variant_id: Option<String>,
     pub status: RunStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

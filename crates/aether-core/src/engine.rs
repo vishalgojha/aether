@@ -48,11 +48,13 @@ impl Orchestrator {
         let started = Instant::now();
         let run_id = Uuid::new_v4().to_string();
         let workflow = req.workflow.clone();
-        self.state.create_run(&run_id, &workflow)?;
+        let variant_id = extract_variant_id(&req.input);
+        self.state
+            .create_run_with_variant(&run_id, &workflow, variant_id.as_deref())?;
         self.state.append_event(
             &run_id,
             "run_created",
-            &json!({ "workflow": req.workflow, "input": req.input }),
+            &json!({ "workflow": req.workflow, "variant_id": variant_id, "input": req.input }),
         )?;
         let result = self.execute(run_id, workflow, 0, 0, 0.0).await;
         self.observe_run_duration("run_new", &result, started.elapsed().as_secs_f64());
@@ -478,6 +480,13 @@ impl Orchestrator {
             .runs_finished
             .with_label_values(&[status_label])
             .inc();
+        if let Err(err) = self.state.append_variant_observation(run_id) {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to append variant observation"
+            );
+        }
         Ok(())
     }
 
@@ -649,4 +658,21 @@ fn run_status_label(status: &RunStatus) -> &'static str {
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
     }
+}
+
+fn extract_variant_id(input: &serde_json::Value) -> Option<String> {
+    [
+        input.get("variant_id"),
+        input.get("variantId"),
+        input.get("variant"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }

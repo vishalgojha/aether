@@ -11,6 +11,7 @@ async function main() {
   await testScoreVariantMonotonicity();
   await testPromotionPersistsActiveAndDecision();
   await testSampleGateBlocksPromotion();
+  await testObservationAggregationAndLatestRunSelection();
   process.stdout.write("evolution tests passed\n");
 }
 
@@ -152,6 +153,70 @@ async function testSampleGateBlocksPromotion() {
   assert.equal(lines.length, 1);
   const loggedDecision = JSON.parse(lines[0]);
   assert.equal(loggedDecision.status, "insufficient_samples");
+}
+
+async function testObservationAggregationAndLatestRunSelection() {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "aether-evolve-observations-"));
+  const inputPath = path.join(stateDir, "variant-observations.jsonl");
+  const lines = [
+    JSON.stringify({
+      timestamp: "2026-03-05T09:00:00.000Z",
+      run_id: "run-1",
+      workflow: "growth",
+      variant_id: "v1",
+      status: "waiting_approval",
+      success: false,
+      duration_sec: 10,
+      total_cost_usd: 0.05
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-05T09:05:00.000Z",
+      run_id: "run-1",
+      workflow: "growth",
+      variant_id: "v1",
+      status: "succeeded",
+      success: true,
+      duration_sec: 34,
+      total_cost_usd: 0.08
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-05T09:10:00.000Z",
+      run_id: "run-2",
+      workflow: "growth",
+      variant_id: "v2",
+      status: "failed",
+      success: false,
+      duration_sec: 21,
+      total_cost_usd: 0.04
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-05T09:15:00.000Z",
+      run_id: "run-3",
+      workflow: "growth",
+      variant_id: "v1",
+      status: "succeeded",
+      success: true,
+      duration_sec: 37,
+      total_cost_usd: 0.09
+    })
+  ];
+  await writeFile(inputPath, `${lines.join("\n")}\n`, "utf-8");
+
+  const decision = await runEvolution({
+    workflow: "growth",
+    stateDir,
+    minSamples: 1,
+    safetyFloor: 0.95,
+    now: new Date("2026-03-05T12:00:00.000Z")
+  });
+
+  assert.equal(decision.input_path.endsWith("variant-observations.jsonl"), true);
+  assert.equal(decision.status, "promoted");
+  assert.equal(decision.promoted_variant, "v1");
+  assert.equal(decision.candidates.length, 2);
+  assert.equal(decision.candidates[0].variant_id, "v1");
+  assert.equal(decision.candidates[0].sample_size, 2);
+  assert.equal(decision.candidates[0].success_rate, 1);
 }
 
 main().catch((error) => {
