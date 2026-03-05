@@ -1,0 +1,13 @@
+{
+  "name": "@aether/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test:resilience": "npm run build && node scripts/socialFlow.resilience.test.mjs"
+  }
+}
